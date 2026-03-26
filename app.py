@@ -3,68 +3,114 @@ import os
 import requests
 from bs4 import BeautifulSoup
 import certifi
-
 import img2pdf
+import streamlit as st
+import tempfile
+from urllib.parse import urljoin, urlparse
 
 os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
 
-#page_index_url = "https://online.fliphtml5.com/nrbfc/pfhy/"
-#page_index_url = "https://online.fliphtml5.com/nrbfc/tjpx/"
-#page_index_url = "https://online.fliphtml5.com/nrbfc/yziu/"
-page_index_url = "https://online.fliphtml5.com/nrbfc/ongi/"
+def get_fliphtml5_pdf(url, progress_bar=None, status_text=None):
+    """
+    Downloads images from a FlipHTML5 URL and converts them to a PDF.
+    Returns the PDF bytes.
+    """
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
 
+    # Ensure URL ends with /
+    if not url.endswith('/'):
+        url += '/'
 
-# 1. Especificando o parser 'html.parser' para evitar o aviso
-page_index = requests.get(page_index_url, headers={'User-Agent': 'Mozilla/5.0...'}, timeout=10)
-soup = BeautifulSoup(page_index.content, 'html.parser')
+    try:
+        if status_text: status_text.text("Obtendo índice da página...")
+        page_index = requests.get(url, headers=headers, timeout=10)
+        page_index.raise_for_status()
+        soup = BeautifulSoup(page_index.content, 'html.parser')
 
-config_script_tag = soup.find_all(lambda tag: tag.name=='script' and tag.attrs.get('src', '').startswith('javascript'))[0]
-config_url = config_script_tag['src']
-config_resp = requests.get(page_index_url + config_url, headers={'User-Agent': 'Mozilla/5.0...'}, timeout=10)
+        # Find the configuration script
+        script_tags = soup.find_all(lambda tag: tag.name=='script' and tag.attrs.get('src', '').startswith('javascript'))
+        if not script_tags:
+            raise Exception("Não foi possível encontrar o script de configuração do FlipHTML5.")
 
-config = json.loads(config_resp.text[17:-1])
-pages = [p['n'][0] for p in config['fliphtml5_pages']]
+        config_url = script_tags[0]['src']
+        config_full_url = urljoin(url, config_url)
 
-# Criar pasta para salvar se não existir
-if not os.path.exists('downloads'):
-    os.makedirs('downloads')
+        if status_text: status_text.text("Obtendo configuração...")
+        config_resp = requests.get(config_full_url, headers=headers, timeout=10)
+        config_resp.raise_for_status()
 
-for idx, page_path in enumerate(pages):
-    # page_path pode vir como './files/large/imagem.webp'
-    # Extraímos apenas 'imagem.webp'
-    pure_filename = os.path.basename(page_path)
+        # The config is typically inside a JSON-like structure: window.viewerConfig = {...};
+        # We need to extract the JSON part.
+        json_str = config_resp.text
+        start_idx = json_str.find('{')
+        end_idx = json_str.rfind('}')
+        if start_idx == -1 or end_idx == -1:
+            raise Exception("Formato de configuração inválido.")
+
+        config = json.loads(json_str[start_idx:end_idx+1])
+        pages = [p['n'][0] for p in config['fliphtml5_pages']]
+
+        if not pages:
+            raise Exception("Nenhuma página encontrada no documento.")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            image_paths = []
+            total_pages = len(pages)
+
+            for idx, page_path in enumerate(pages):
+                pure_filename = os.path.basename(page_path)
+                # Some fliphtml5 links use different paths, we try to be robust
+                page_url = urljoin(url, 'files/large/' + pure_filename)
+
+                if status_text: status_text.text(f"Baixando página {idx+1} de {total_pages}...")
+                if progress_bar: progress_bar.progress((idx + 1) / total_pages)
+
+                img_resp = requests.get(page_url, headers=headers, timeout=10)
+                if img_resp.status_code == 200:
+                    save_path = os.path.join(tmp_dir, f"{idx:04d}_{pure_filename}")
+                    with open(save_path, 'wb') as f:
+                        f.write(img_resp.content)
+                    image_paths.append(save_path)
+                else:
+                    # Fallback or error? For now, we continue if possible
+                    st.warning(f"Falha ao baixar a página {idx+1}")
+
+            if not image_paths:
+                raise Exception("Nenhuma imagem pôde ser baixada.")
+
+            if status_text: status_text.text("Gerando PDF...")
+            pdf_bytes = img2pdf.convert(sorted(image_paths))
+            return pdf_bytes
+
+    except Exception as e:
+        st.error(f"Erro: {str(e)}")
+        return None
+
+def main():
+    st.set_page_config(page_title="FlipHTML5 to PDF Downloader", page_icon="📄")
     
-    page_url = page_index_url + 'files/large/' + pure_filename
-    save_path = os.path.join('downloads', f"{1+idx:04}-{pure_filename}")
-    
-    print(f"Baixando: {save_path}")
-    
-    one_page_resp = requests.get(page_url, headers={'User-Agent': 'Mozilla/5.0...'}, timeout=10)
-    
-    if one_page_resp.status_code == 200:
-        with open(save_path, 'wb') as f:
-            f.write(one_page_resp.content)
+    st.title("📄 FlipHTML5 to PDF Downloader")
+    st.write("Insira a URL do FlipHTML5 abaixo para gerar o PDF completo.")
 
-def generate_pdf(image_folder, output_pdf):
-    print(f"Gerando PDF: {output_pdf}...")
-    
-    # Lista todos os arquivos .webp na pasta e ordena alfabeticamente
-    # A ordenação pelo prefixo 0001, 0002 garante a sequência correta
-    images = [
-        os.path.join(image_folder, f) 
-        for f in sorted(os.listdir(image_folder)) 
-        if f.endswith('.webp')
-    ]
+    url = st.text_input("URL do FlipHTML5", placeholder="https://online.fliphtml5.com/xxxx/yyyy/")
 
-    if not images:
-        print("Nenhuma imagem encontrada para gerar o PDF.")
-        return
+    if st.button("Gerar PDF"):
+        if not url:
+            st.error("Por favor, informe uma URL.")
+        else:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-    # Converte a lista de imagens para um único PDF
-    with open(output_pdf, "wb") as f:
-        f.write(img2pdf.convert(images))
-    
-    print(f"Sucesso! PDF gerado em: {os.path.abspath(output_pdf)}")
+            pdf_data = get_fliphtml5_pdf(url, progress_bar, status_text)
 
-# Executa a função após o loop de download
-generate_pdf('downloads', 'resultado_fliphtml5.pdf')
+            if pdf_data:
+                status_text.success("PDF gerado com sucesso!")
+                st.download_button(
+                    label="Baixar PDF",
+                    data=pdf_data,
+                    file_name="documento.pdf",
+                    mime="application/pdf"
+                )
+
+if __name__ == "__main__":
+    main()
