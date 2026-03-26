@@ -1,0 +1,6 @@
+__pycache__/
+downloads/
+*.pdf
+*.log
+test_app.py
+/home/jules/verification/
