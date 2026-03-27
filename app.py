@@ -7,10 +7,11 @@ import img2pdf
 import streamlit as st
 import tempfile
 from urllib.parse import urljoin, urlparse
+from PIL import Image
 
 os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
 
-def get_fliphtml5_pdf(url, progress_bar=None, status_text=None):
+def get_fliphtml5_pdf(url, progress_bar=None, status_text=None, optimize=False, quality=75):
     """
     Downloads images from a FlipHTML5 URL and converts them to a PDF.
     Returns the PDF bytes.
@@ -70,6 +71,11 @@ def get_fliphtml5_pdf(url, progress_bar=None, status_text=None):
                     save_path = os.path.join(tmp_dir, f"{idx:04d}_{pure_filename}")
                     with open(save_path, 'wb') as f:
                         f.write(img_resp.content)
+
+                    if optimize:
+                        with Image.open(save_path) as img:
+                            img.save(save_path, format=img.format, quality=quality)
+
                     image_paths.append(save_path)
                 else:
                     # Fallback or error? For now, we continue if possible
@@ -94,6 +100,9 @@ def main():
 
     url = st.text_input("URL do FlipHTML5", placeholder="https://online.fliphtml5.com/xxxx/yyyy/")
 
+    optimize = st.checkbox("Otimizar imagens (reduz o tamanho do PDF)", value=False)
+    quality = st.slider("Qualidade da compressão", 1, 100, 80, disabled=not optimize)
+
     if st.button("Gerar PDF"):
         if not url:
             st.error("Por favor, informe uma URL.")
@@ -101,7 +110,7 @@ def main():
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-            pdf_data = get_fliphtml5_pdf(url, progress_bar, status_text)
+            pdf_data = get_fliphtml5_pdf(url, progress_bar, status_text, optimize, quality)
 
             if pdf_data:
                 status_text.success("PDF gerado com sucesso!")
