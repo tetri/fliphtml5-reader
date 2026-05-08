@@ -8,15 +8,35 @@ import streamlit as st
 import tempfile
 from urllib.parse import urljoin, urlparse
 from PIL import Image
+import concurrent.futures
 
 os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+
+def download_page(idx, page_path, url, session, tmp_dir, optimize, quality):
+    pure_filename = os.path.basename(page_path)
+    page_url = urljoin(url, 'files/large/' + pure_filename)
+
+    img_resp = session.get(page_url, timeout=10)
+    if img_resp.status_code == 200:
+        save_path = os.path.join(tmp_dir, f"{idx:04d}_{pure_filename}")
+        with open(save_path, 'wb') as f:
+            f.write(img_resp.content)
+
+        if optimize:
+            with Image.open(save_path) as img:
+                img.save(save_path, format=img.format, quality=quality)
+
+        return save_path, None
+    else:
+        return None, f"Falha ao baixar a página {idx+1}"
 
 def get_fliphtml5_pdf(url, progress_bar=None, status_text=None, optimize=False, quality=75):
     """
     Downloads images from a FlipHTML5 URL and converts them to a PDF.
     Returns the PDF bytes.
     """
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'})
 
     # Ensure URL ends with /
     if not url.endswith('/'):
@@ -24,7 +44,7 @@ def get_fliphtml5_pdf(url, progress_bar=None, status_text=None, optimize=False, 
 
     try:
         if status_text: status_text.text("Obtendo índice da página...")
-        page_index = requests.get(url, headers=headers, timeout=10)
+        page_index = session.get(url, timeout=10)
         page_index.raise_for_status()
         soup = BeautifulSoup(page_index.content, 'html.parser')
 
@@ -37,7 +57,7 @@ def get_fliphtml5_pdf(url, progress_bar=None, status_text=None, optimize=False, 
         config_full_url = urljoin(url, config_url)
 
         if status_text: status_text.text("Obtendo configuração...")
-        config_resp = requests.get(config_full_url, headers=headers, timeout=10)
+        config_resp = session.get(config_full_url, timeout=10)
         config_resp.raise_for_status()
 
         # The config is typically inside a JSON-like structure: window.viewerConfig = {...};
@@ -57,35 +77,36 @@ def get_fliphtml5_pdf(url, progress_bar=None, status_text=None, optimize=False, 
         with tempfile.TemporaryDirectory() as tmp_dir:
             image_paths = []
             total_pages = len(pages)
+            completed_pages = 0
 
-            for idx, page_path in enumerate(pages):
-                pure_filename = os.path.basename(page_path)
-                # Some fliphtml5 links use different paths, we try to be robust
-                page_url = urljoin(url, 'files/large/' + pure_filename)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                future_to_idx = {
+                    executor.submit(download_page, idx, page_path, url, session, tmp_dir, optimize, quality): idx
+                    for idx, page_path in enumerate(pages)
+                }
 
-                if status_text: status_text.text(f"Baixando página {idx+1} de {total_pages}...")
-                if progress_bar: progress_bar.progress((idx + 1) / total_pages)
+                for future in concurrent.futures.as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        save_path, error = future.result()
+                        if save_path:
+                            image_paths.append(save_path)
+                        if error:
+                            st.warning(error)
+                    except Exception as exc:
+                        st.warning(f"Falha ao baixar a página {idx+1}: {exc}")
 
-                img_resp = requests.get(page_url, headers=headers, timeout=10)
-                if img_resp.status_code == 200:
-                    save_path = os.path.join(tmp_dir, f"{idx:04d}_{pure_filename}")
-                    with open(save_path, 'wb') as f:
-                        f.write(img_resp.content)
-
-                    if optimize:
-                        with Image.open(save_path) as img:
-                            img.save(save_path, format=img.format, quality=quality)
-
-                    image_paths.append(save_path)
-                else:
-                    # Fallback or error? For now, we continue if possible
-                    st.warning(f"Falha ao baixar a página {idx+1}")
+                    completed_pages += 1
+                    if status_text: status_text.text(f"Baixadas {completed_pages} de {total_pages} páginas...")
+                    if progress_bar: progress_bar.progress(completed_pages / total_pages)
 
             if not image_paths:
                 raise Exception("Nenhuma imagem pôde ser baixada.")
 
+            image_paths.sort()
+
             if status_text: status_text.text("Gerando PDF...")
-            pdf_bytes = img2pdf.convert(sorted(image_paths))
+            pdf_bytes = img2pdf.convert(image_paths)
             return pdf_bytes
 
     except Exception as e:
