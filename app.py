@@ -69,10 +69,18 @@ def get_fliphtml5_pdf(url, progress_bar=None, status_text=None, optimize=False, 
             raise Exception("Formato de configuração inválido.")
 
         config = json.loads(json_str[start_idx:end_idx+1])
-        pages = [p['n'][0] for p in config['fliphtml5_pages']]
+        pages_raw = config.get('fliphtml5_pages')
+
+        pages = []
+        if isinstance(pages_raw, list):
+            pages = [p['n'][0] for p in pages_raw if isinstance(p, dict) and 'n' in p]
+        elif isinstance(pages_raw, str):
+            # Quando a publicação é encriptada/protegida (fliphtml5_pages vem como string codificada)
+            # ou quando a estrutura é diferente de uma lista de objetos
+            raise Exception("Esta publicação possui páginas encriptadas/protegidas pelo FlipHTML5 e não pode ser baixada por este método.")
 
         if not pages:
-            raise Exception("Nenhuma página encontrada no documento.")
+            raise Exception("Nenhuma página válida encontrada no documento.")
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             image_paths = []
@@ -110,7 +118,8 @@ def get_fliphtml5_pdf(url, progress_bar=None, status_text=None, optimize=False, 
             return pdf_bytes
 
     except Exception as e:
-        st.error(f"Erro: {str(e)}")
+        st.error(f"Erro ao processar a publicação: {str(e)}")
+        st.info("Dica: Certifique-se de que a URL inserida é uma publicação pública do FlipHTML5 válida.")
         return None
 
 def main():
