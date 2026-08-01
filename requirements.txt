@@ -44,3 +44,4 @@ tzdata==2025.3
 urllib3==2.6.3
 watchdog==6.0.0
 wrapt==2.1.2
+playwright==1.62.0

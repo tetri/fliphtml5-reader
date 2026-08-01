@@ -30,6 +30,75 @@ def download_page(idx, page_path, url, session, tmp_dir, optimize, quality):
     else:
         return None, f"Falha ao baixar a página {idx+1}"
 
+def get_pdf_via_playwright(url, progress_bar=None, status_text=None, optimize=False, quality=75):
+    from playwright.sync_api import sync_playwright
+    import time
+    
+    if status_text: status_text.text("Iniciando navegador headless para extrair publicação encriptada...")
+    
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(viewport={'width': 1280, 'height': 960})
+        page = context.new_page()
+        
+        captured_images = {}
+        page.on('response', lambda r: captured_images.update({r.url: True}) if ('files/large/' in r.url) else None)
+        
+        if status_text: status_text.text("Carregando leitor do FlipHTML5...")
+        page.goto(url)
+        page.wait_for_load_state('networkidle')
+        time.sleep(2)
+        
+        total_pages = page.evaluate('''() => {
+            var c = window.htmlConfig || window.viewerConfig;
+            return c ? (c.search_pages ? c.search_pages.length : 0) : 0;
+        }''')
+        
+        if not total_pages:
+            total_pages = 20 # Fallback padrão se não puder ler a contagem
+            
+        if status_text: status_text.text(f"Navegando e capturando {total_pages} páginas...")
+        
+        for i in range(total_pages):
+            page.keyboard.press('ArrowRight')
+            time.sleep(0.8)
+            if progress_bar:
+                progress_bar.progress(min(1.0, (i + 1) / total_pages))
+            if status_text:
+                status_text.text(f"Capturando páginas ({i+1}/{total_pages})...")
+                
+        time.sleep(2)
+        browser.close()
+        
+        image_urls = list(captured_images.keys())
+        if not image_urls:
+            raise Exception("Não foi possível interceptar as imagens das páginas.")
+            
+        session = requests.Session()
+        session.headers.update({'User-Agent': 'Mozilla/5.0'})
+        
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            image_paths = []
+            for idx, img_url in enumerate(image_urls):
+                resp = session.get(img_url, timeout=10)
+                if resp.status_code == 200:
+                    ext = '.webp' if '.webp' in img_url else '.jpg'
+                    save_path = os.path.join(tmp_dir, f"{idx:04d}{ext}")
+                    with open(save_path, 'wb') as f:
+                        f.write(resp.content)
+                    
+                    if optimize or ext == '.webp':
+                        with Image.open(save_path) as img:
+                            rgb_img = img.convert('RGB')
+                            rgb_img.save(save_path, format='JPEG', quality=quality)
+                    
+                    image_paths.append(save_path)
+            
+            image_paths.sort()
+            if status_text: status_text.text("Gerando arquivo PDF final...")
+            pdf_bytes = img2pdf.convert(image_paths)
+            return pdf_bytes
+
 def get_fliphtml5_pdf(url, progress_bar=None, status_text=None, optimize=False, quality=75):
     """
     Downloads images from a FlipHTML5 URL and converts them to a PDF.
@@ -38,7 +107,6 @@ def get_fliphtml5_pdf(url, progress_bar=None, status_text=None, optimize=False, 
     session = requests.Session()
     session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'})
 
-    # Ensure URL ends with /
     if not url.endswith('/'):
         url += '/'
 
@@ -48,7 +116,6 @@ def get_fliphtml5_pdf(url, progress_bar=None, status_text=None, optimize=False, 
         page_index.raise_for_status()
         soup = BeautifulSoup(page_index.content, 'html.parser')
 
-        # Find the configuration script
         script_tags = soup.find_all(lambda tag: tag.name=='script' and tag.attrs.get('src', '').startswith('javascript'))
         if not script_tags:
             raise Exception("Não foi possível encontrar o script de configuração do FlipHTML5.")
@@ -60,8 +127,6 @@ def get_fliphtml5_pdf(url, progress_bar=None, status_text=None, optimize=False, 
         config_resp = session.get(config_full_url, timeout=10)
         config_resp.raise_for_status()
 
-        # The config is typically inside a JSON-like structure: window.viewerConfig = {...};
-        # We need to extract the JSON part.
         json_str = config_resp.text
         start_idx = json_str.find('{')
         end_idx = json_str.rfind('}')
@@ -75,12 +140,13 @@ def get_fliphtml5_pdf(url, progress_bar=None, status_text=None, optimize=False, 
         if isinstance(pages_raw, list):
             pages = [p['n'][0] for p in pages_raw if isinstance(p, dict) and 'n' in p]
         elif isinstance(pages_raw, str):
-            # Quando a publicação é encriptada/protegida (fliphtml5_pages vem como string codificada)
-            # ou quando a estrutura é diferente de uma lista de objetos
-            raise Exception("Esta publicação possui páginas encriptadas/protegidas pelo FlipHTML5 e não pode ser baixada por este método.")
+            # Se a publicação for encriptada (fliphtml5_pages é string), dispara o fallback com Playwright
+            st.info("Publicação encriptada detectada! Acionando modo de captura headless...")
+            return get_pdf_via_playwright(url, progress_bar, status_text, optimize, quality)
 
         if not pages:
-            raise Exception("Nenhuma página válida encontrada no documento.")
+            st.info("Estrutura não padrão detectada! Acionando modo de captura headless...")
+            return get_pdf_via_playwright(url, progress_bar, status_text, optimize, quality)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             image_paths = []
@@ -118,9 +184,13 @@ def get_fliphtml5_pdf(url, progress_bar=None, status_text=None, optimize=False, 
             return pdf_bytes
 
     except Exception as e:
-        st.error(f"Erro ao processar a publicação: {str(e)}")
-        st.info("Dica: Certifique-se de que a URL inserida é uma publicação pública do FlipHTML5 válida.")
-        return None
+        st.warning(f"Tentando modo alternativo devido a: {str(e)}")
+        try:
+            return get_pdf_via_playwright(url, progress_bar, status_text, optimize, quality)
+        except Exception as fallback_err:
+            st.error(f"Erro ao processar a publicação: {str(fallback_err)}")
+            st.info("Dica: Certifique-se de que a URL inserida é uma publicação pública do FlipHTML5 válida.")
+            return None
 
 def main():
     st.set_page_config(page_title="FlipHTML5 to PDF Downloader", page_icon="📄")
